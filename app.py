@@ -1,7 +1,7 @@
-from flask import Flask, render_template_string, request, redirect, session
+from flask import Flask, request, redirect, session
 import sqlite3
 import os
-from datetime import datetime
+from datetime import datetime, timedelta
 
 app = Flask(__name__)
 app.secret_key = "secreto"
@@ -18,6 +18,7 @@ def get_db():
 
 def init_db():
     conn = get_db()
+
     conn.execute('''
         CREATE TABLE IF NOT EXISTS users (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -26,6 +27,7 @@ def init_db():
             role TEXT
         )
     ''')
+
     conn.execute('''
         CREATE TABLE IF NOT EXISTS documentos (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -33,30 +35,58 @@ def init_db():
             archivo TEXT,
             fecha TEXT,
             estado TEXT,
-            usuario TEXT
+            usuario TEXT,
+            prioridad TEXT
         )
     ''')
 
-    # Usuario inicial
     user = conn.execute("SELECT * FROM users WHERE username='admin'").fetchone()
     if not user:
         conn.execute("INSERT INTO users (username, password, role) VALUES ('admin','1234','admin')")
         conn.execute("INSERT INTO users (username, password, role) VALUES ('impresor','1234','impresor')")
+
     conn.commit()
     conn.close()
 
 init_db()
 
+# ---------------- LIMPIEZA AUTOMÁTICA ----------------
+
+def limpiar_documentos():
+    conn = get_db()
+    docs = conn.execute("SELECT * FROM documentos").fetchall()
+
+    ahora = datetime.now()
+
+    for d in docs:
+        fecha_doc = datetime.strptime(d["fecha"], "%Y-%m-%d %H:%M")
+        
+        if ahora - fecha_doc > timedelta(days=15):
+            # eliminar archivo físico
+            if os.path.exists(d["archivo"]):
+                os.remove(d["archivo"])
+            
+            # eliminar de base de datos
+            conn.execute("DELETE FROM documentos WHERE id=?", (d["id"],))
+
+    conn.commit()
+    conn.close()
+
 # ---------------- LOGIN ----------------
 
 @app.route("/", methods=["GET", "POST"])
 def login():
+    limpiar_documentos()  # 👈 se ejecuta automáticamente
+
     if request.method == "POST":
         user = request.form["username"]
         password = request.form["password"]
 
         conn = get_db()
-        u = conn.execute("SELECT * FROM users WHERE username=? AND password=?", (user, password)).fetchone()
+        u = conn.execute(
+            "SELECT * FROM users WHERE username=? AND password=?",
+            (user, password)
+        ).fetchone()
         conn.close()
 
         if u:
@@ -67,8 +97,8 @@ def login():
     return '''
     <h2>Login</h2>
     <form method="post">
-        Usuario: <input name="username"><br>
-        Clave: <input name="password" type="password"><br>
+        Usuario: <input name="username"><br><br>
+        Clave: <input name="password" type="password"><br><br>
         <button>Entrar</button>
     </form>
     '''
@@ -84,27 +114,54 @@ def dashboard():
 
     if request.method == "POST":
         file = request.files["archivo"]
-        filename = file.filename
-        path = os.path.join(UPLOAD_FOLDER, filename)
-        file.save(path)
+        prioridad = request.form["prioridad"]
 
-        conn.execute(
-            "INSERT INTO documentos (nombre, archivo, fecha, estado, usuario) VALUES (?, ?, ?, ?, ?)",
-            (filename, path, datetime.now().strftime("%Y-%m-%d %H:%M"), "pendiente", session["user"])
-        )
-        conn.commit()
+        if file.filename != "":
+            filename = file.filename
+            path = os.path.join(UPLOAD_FOLDER, filename)
+            file.save(path)
 
-    docs = conn.execute("SELECT * FROM documentos ORDER BY id DESC").fetchall()
+            conn.execute(
+                "INSERT INTO documentos (nombre, archivo, fecha, estado, usuario, prioridad) VALUES (?, ?, ?, ?, ?, ?)",
+                (
+                    filename,
+                    path,
+                    datetime.now().strftime("%Y-%m-%d %H:%M"),
+                    "pendiente",
+                    session["user"],
+                    prioridad
+                )
+            )
+            conn.commit()
+
+    docs = conn.execute("""
+        SELECT * FROM documentos
+        ORDER BY 
+            CASE prioridad
+                WHEN 'alta' THEN 1
+                WHEN 'media' THEN 2
+                WHEN 'baja' THEN 3
+            END,
+            id DESC
+    """).fetchall()
+
     conn.close()
 
-    html = "<h2>Bienvenido " + session["user"] + "</h2>"
+    html = f"<h2>Bienvenido {session['user']}</h2>"
 
-    # Subir archivo (solo profesores/admin)
     if session["role"] != "impresor":
         html += '''
         <h3>Subir documento</h3>
         <form method="post" enctype="multipart/form-data">
-            <input type="file" name="archivo">
+            <input type="file" name="archivo"><br><br>
+
+            Prioridad:
+            <select name="prioridad">
+                <option value="alta">Alta</option>
+                <option value="media">Media</option>
+                <option value="baja">Baja</option>
+            </select><br><br>
+
             <button>Subir</button>
         </form>
         '''
@@ -112,9 +169,8 @@ def dashboard():
     html += "<h3>Documentos</h3>"
 
     for d in docs:
-        html += f"<p>{d['nombre']} | {d['estado']} | {d['usuario']} "
+        html += f"<p>{d['nombre']} | {d['prioridad']} | {d['estado']} | {d['usuario']} | {d['fecha']} "
 
-        # Botón imprimir solo impresor
         if session["role"] == "impresor" and d["estado"] == "pendiente":
             html += f"<a href='/imprimir/{d['id']}'>[Marcar como impreso]</a>"
 
@@ -146,3 +202,6 @@ def logout():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+    
+
+   
