@@ -1,146 +1,148 @@
-
-from flask import Flask, request, redirect, render_template_string, session
+from flask import Flask, render_template_string, request, redirect, session
+import sqlite3
 import os
+from datetime import datetime
 
 app = Flask(__name__)
-app.secret_key = "secret123"
+app.secret_key = "secreto"
 
-# Carpeta para archivos
-UPLOAD_FOLDER = 'uploads'
+UPLOAD_FOLDER = "uploads"
 os.makedirs(UPLOAD_FOLDER, exist_ok=True)
 
-# Usuarios
-users = {
-    "admin": "1234",
-    "profesor": "1234"
-}
+# ---------------- BASE DE DATOS ----------------
 
-# Lista de trabajos
-print_jobs = []
+def get_db():
+    conn = sqlite3.connect("database.db")
+    conn.row_factory = sqlite3.Row
+    return conn
 
-# HTML LOGIN
-LOGIN_HTML = """
-<h2>Login</h2>
-<form method='post'>
-<input name='user' placeholder='Usuario'><br>
-<input name='pass' type='password' placeholder='Clave'><br>
-<button>Ingresar</button>
-</form>
-"""
+def init_db():
+    conn = get_db()
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS users (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            username TEXT,
+            password TEXT,
+            role TEXT
+        )
+    ''')
+    conn.execute('''
+        CREATE TABLE IF NOT EXISTS documentos (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            nombre TEXT,
+            archivo TEXT,
+            fecha TEXT,
+            estado TEXT,
+            usuario TEXT
+        )
+    ''')
 
-# HTML PRINCIPAL
-HTML = """
-<h2>🖨️ Sistema de Impresiones</h2>
-<p>Usuario: {{session['user']}}</p>
-<a href='/logout'>Cerrar sesión</a>
+    # Usuario inicial
+    user = conn.execute("SELECT * FROM users WHERE username='admin'").fetchone()
+    if not user:
+        conn.execute("INSERT INTO users (username, password, role) VALUES ('admin','1234','admin')")
+        conn.execute("INSERT INTO users (username, password, role) VALUES ('impresor','1234','impresor')")
+    conn.commit()
+    conn.close()
 
-<h3>Agregar documento</h3>
-<form method='post' action='/add' enctype='multipart/form-data'>
-<input name='name' placeholder='Nombre documento'><br>
-<input name='course' placeholder='Curso'><br>
-<input type='date' name='date'><br>
-<input type='time' name='time'><br>
+init_db()
 
-<input type='file' name='file'><br>
+# ---------------- LOGIN ----------------
 
-<select name='priority'>
-<option value='1'>Alta</option>
-<option value='2'>Media</option>
-<option value='3'>Baja</option>
-</select><br>
-
-<button>Agregar</button>
-</form>
-
-<h3>Cola de impresión</h3>
-{% for job in jobs %}
-<div style="border:1px solid black; margin:10px; padding:10px;">
-<b>{{job['name']}}</b><br>
-Curso: {{job['course']}}<br>
-Fecha: {{job['date']}} {{job['time']}}<br>
-Prioridad: {{job['priority']}}<br>
-Estado: {{job['status']}}<br>
-Archivo: {{job['file']}}<br>
-
-{% if job['status']=='pendiente' %}
-<a href='/print/{{loop.index0}}'>
-<button>Marcar como impreso</button>
-</a>
-{% else %}
-<p>✅ Impreso</p>
-{% endif %}
-</div>
-{% endfor %}
-"""
-
-# Ordenar trabajos
-def sort_jobs():
-    return sorted(print_jobs, key=lambda x: (x['date'], x['time'], x['priority']))
-
-# LOGIN
-@app.route('/', methods=['GET', 'POST'])
+@app.route("/", methods=["GET", "POST"])
 def login():
-    if request.method == 'POST':
-        user = request.form['user']
-        pw = request.form['pass']
-        if user in users and users[user] == pw:
-            session['user'] = user
-            return redirect('/home')
-        else:
-            return "Login incorrecto"
-    return render_template_string(LOGIN_HTML)
+    if request.method == "POST":
+        user = request.form["username"]
+        password = request.form["password"]
 
-# HOME
-@app.route('/home')
-def home():
-    if 'user' not in session:
-        return redirect('/')
-    return render_template_string(HTML, jobs=sort_jobs(), session=session)
+        conn = get_db()
+        u = conn.execute("SELECT * FROM users WHERE username=? AND password=?", (user, password)).fetchone()
+        conn.close()
 
-# LOGOUT
-@app.route('/logout')
+        if u:
+            session["user"] = user
+            session["role"] = u["role"]
+            return redirect("/dashboard")
+
+    return '''
+    <h2>Login</h2>
+    <form method="post">
+        Usuario: <input name="username"><br>
+        Clave: <input name="password" type="password"><br>
+        <button>Entrar</button>
+    </form>
+    '''
+
+# ---------------- DASHBOARD ----------------
+
+@app.route("/dashboard", methods=["GET", "POST"])
+def dashboard():
+    if "user" not in session:
+        return redirect("/")
+
+    conn = get_db()
+
+    if request.method == "POST":
+        file = request.files["archivo"]
+        filename = file.filename
+        path = os.path.join(UPLOAD_FOLDER, filename)
+        file.save(path)
+
+        conn.execute(
+            "INSERT INTO documentos (nombre, archivo, fecha, estado, usuario) VALUES (?, ?, ?, ?, ?)",
+            (filename, path, datetime.now().strftime("%Y-%m-%d %H:%M"), "pendiente", session["user"])
+        )
+        conn.commit()
+
+    docs = conn.execute("SELECT * FROM documentos ORDER BY id DESC").fetchall()
+    conn.close()
+
+    html = "<h2>Bienvenido " + session["user"] + "</h2>"
+
+    # Subir archivo (solo profesores/admin)
+    if session["role"] != "impresor":
+        html += '''
+        <h3>Subir documento</h3>
+        <form method="post" enctype="multipart/form-data">
+            <input type="file" name="archivo">
+            <button>Subir</button>
+        </form>
+        '''
+
+    html += "<h3>Documentos</h3>"
+
+    for d in docs:
+        html += f"<p>{d['nombre']} | {d['estado']} | {d['usuario']} "
+
+        # Botón imprimir solo impresor
+        if session["role"] == "impresor" and d["estado"] == "pendiente":
+            html += f"<a href='/imprimir/{d['id']}'>[Marcar como impreso]</a>"
+
+        html += "</p>"
+
+    html += "<br><a href='/logout'>Cerrar sesión</a>"
+
+    return html
+
+# ---------------- IMPRIMIR ----------------
+
+@app.route("/imprimir/<int:id>")
+def imprimir(id):
+    conn = get_db()
+    conn.execute("UPDATE documentos SET estado='impreso' WHERE id=?", (id,))
+    conn.commit()
+    conn.close()
+    return redirect("/dashboard")
+
+# ---------------- LOGOUT ----------------
+
+@app.route("/logout")
 def logout():
     session.clear()
-    return redirect('/')
+    return redirect("/")
 
-# AGREGAR TRABAJO + ARCHIVO
-@app.route('/add', methods=['POST'])
-def add():
-    if 'user' not in session:
-        return redirect('/')
+# ---------------- RUN ----------------
 
-    file = request.files['file']
-    filename = ""
-
-    if file and file.filename != "":
-        filename = file.filename
-        file.save(os.path.join(UPLOAD_FOLDER, filename))
-
-    job = {
-        'name': request.form['name'],
-        'course': request.form['course'],
-        'date': request.form['date'],
-        'time': request.form['time'],
-        'priority': int(request.form['priority']),
-        'status': 'pendiente',
-        'file': filename
-    }
-
-    print_jobs.append(job)
-    return redirect('/home')
-
-# MARCAR COMO IMPRESO
-@app.route('/print/<int:id>')
-def print_job(id):
-    if 'user' not in session:
-        return redirect('/')
-    print_jobs[id]['status'] = 'impreso'
-    print(f"IMPRESO: {print_jobs[id]['name']}")
-    return redirect('/home')
-
-# INICIAR APP
-import os
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
-    app.run(host='0.0.0.0', port=port)
+    app.run(host="0.0.0.0", port=port)
